@@ -1,4 +1,5 @@
-name = "fujin-line-webhook"
+</> TOML
+
 main = "src/index.js"
 compatibility_date = "2026-06-30"
 
