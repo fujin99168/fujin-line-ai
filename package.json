@@ -1,0 +1,14 @@
+{
+  "name": "fujin-line-ai",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "google-auth-library": "^9.15.1",
+    "googleapis": "^150.0.1"
+  }
+}
