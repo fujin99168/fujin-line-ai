@@ -1,5 +1,1 @@
-name = "fujin-line-webhook"
-main = "src/index.js"
-compatibility_date = "2026-06-30"
 
-workers_dev = true
