@@ -84,10 +84,20 @@ export default {
       }
 
       return new Response("OK", { status: 200 });
-    } catch (err) {
-      await appendErrorLog(env, "WEBHOOK_ERROR", String(err && err.stack ? err.stack : err));
-      return new Response("OK", { status: 200 });
+   } catch (err) {
+  const msg = String(err && err.stack ? err.stack : err).slice(0, 800);
+  console.log("WEBHOOK_ERROR", msg);
+
+  try {
+    const payload = JSON.parse(bodyText || "{}");
+    const event = payload.events && payload.events[0];
+    if (event && event.replyToken) {
+      await replyLine(env, event.replyToken, "寫入 Google Sheet 失敗：\n" + msg);
     }
+  } catch (_) {}
+
+  return new Response("OK", { status: 200 });
+}
   }
 };
 
