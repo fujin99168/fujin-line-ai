@@ -1,24 +1,10 @@
-// Fujin LINE AI v1
-// LINE Webhook -> Cloudflare Worker -> Google Sheets
-// Required Cloudflare variables/secrets:
-// - GOOGLE_SERVICE_ACCOUNT  (JSON from Google Service Account)
-// - SHEET_ID                (Google Sheet ID)
-// - LINE_CHANNEL_SECRET     (LINE Channel secret)
-// - LINE_CHANNEL_ACCESS_TOKEN (LINE Messaging API access token, optional for reply)
-
-const DEFAULT_SHEET_NAME = "派工紀錄";
+const SHEET_AI = "AI派工";
+const SHEET_DISPATCH = "01_派工紀錄";
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
     if (request.method === "GET") {
-      return jsonResponse({
-        ok: true,
-        service: "Fujin LINE AI",
-        version: "v1",
-        message: "Webhook is running"
-      });
+      return jsonResponse({ ok: true, service: "Fujin LINE AI", version: "v2" });
     }
 
     if (request.method !== "POST") {
@@ -28,105 +14,203 @@ export default {
     const bodyText = await request.text();
 
     try {
-      // LINE signature verification
       const signature = request.headers.get("x-line-signature") || "";
-      if (env.LINE_CHANNEL_SECRET) {
-        const valid = await verifyLineSignature(bodyText, env.LINE_CHANNEL_SECRET, signature);
-        if (!valid) {
-          await appendErrorLog(env, "LINE_SIGNATURE_INVALID", bodyText);
-          return new Response("Unauthorized", { status: 401 });
-        }
-      }
+      const valid = await verifyLineSignature(bodyText, env.LINE_CHANNEL_SECRET, signature);
+      if (!valid) return new Response("Unauthorized", { status: 401 });
 
       const payload = JSON.parse(bodyText || "{}");
-      const events = Array.isArray(payload.events) ? payload.events : [];
-
-      if (events.length === 0) {
-        await appendRows(env, [[
-          nowTaiwan(),
-          "verify",
-          "",
-          "",
-          "",
-          "",
-          "",
-          bodyText
-        ]]);
-        return new Response("OK", { status: 200 });
-      }
-
-      const rows = [];
+      const events = payload.events || [];
 
       for (const event of events) {
+        if (event.type !== "message") continue;
+        if (!event.message || event.message.type !== "text") continue;
+
+        const text = event.message.text || "";
         const source = event.source || {};
-        const message = event.message || {};
-        const text = message.type === "text" ? message.text : `[${message.type || event.type}]`;
 
-        rows.push([
-          nowTaiwan(),
-          source.type || "",
-          source.groupId || "",
-          source.roomId || "",
-          source.userId || "",
-          event.type || "",
-          text || "",
-          JSON.stringify(event)
-        ]);
+        const ai = await parseDispatchWithAI(text, env);
 
-        // Optional simple reply for direct/group testing
-        if (event.replyToken && message.type === "text" && shouldReply(text)) {
-          ctx.waitUntil(replyLine(env, event.replyToken, "已收到，已寫入福進環保派工紀錄。"));
+        if (!ai.is_dispatch) {
+          if (event.replyToken) {
+            await replyLine(env, event.replyToken, "已收到，但我判斷這不是派工訊息。");
+          }
+          continue;
         }
-      }
 
-      if (rows.length > 0) {
-        await appendRows(env, rows);
+        const now = nowTaiwan();
+        const dispatchId = makeDispatchId();
+
+        await appendRows(env, SHEET_AI, [[
+          now,
+          ai.customer || "",
+          ai.scheduled_date || "",
+          ai.address || "",
+          ai.waste_type || "",
+          ai.vehicle || "",
+          ai.estimated_quantity || "",
+          ai.unit_price || "",
+          "待派工",
+          text
+        ]]);
+
+        await appendRows(env, SHEET_DISPATCH, [[
+          dispatchId,
+          now,
+          ai.scheduled_date || "",
+          ai.customer || "",
+          ai.waste_type || "",
+          ai.address || "",
+          ai.vehicle || "",
+          ai.estimated_quantity || "",
+          ai.unit || "",
+          "待派工",
+          ai.note || "",
+          source.type || "",
+          source.userId || "",
+          source.groupId || ""
+        ]]);
+
+        if (event.replyToken) {
+          await replyLine(env, event.replyToken,
+`已建立派工：
+編號：${dispatchId}
+客戶：${ai.customer || "未判斷"}
+日期：${ai.scheduled_date || "未填"}
+種類：${ai.waste_type || "未填"}
+位置：${ai.address || "未填"}
+車輛：${ai.vehicle || "未填"}
+預估：${ai.estimated_quantity || "未填"}`
+          );
+        }
       }
 
       return new Response("OK", { status: 200 });
-   } catch (err) {
-  const msg = String(err && err.stack ? err.stack : err).slice(0, 800);
-  console.log("WEBHOOK_ERROR", msg);
-
-  try {
-    const payload = JSON.parse(bodyText || "{}");
-    const event = payload.events && payload.events[0];
-    if (event && event.replyToken) {
-      await replyLine(env, event.replyToken, "寫入 Google Sheet 失敗：\n" + msg);
+    } catch (err) {
+      console.log("ERROR", err.stack || err);
+      return new Response("OK", { status: 200 });
     }
-  } catch (_) {}
-
-  return new Response("OK", { status: 200 });
-}
   }
 };
 
-function shouldReply(text) {
-  if (!text) return false;
-  const t = String(text).trim().toLowerCase();
-  return t === "test" || t === "測試" || t === "測試123" || t.includes("測試");
+async function parseDispatchWithAI(message, env) {
+  if (!env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+  const today = nowTaiwan();
+
+  const systemPrompt = `
+你是福進環保有限公司的派工AI。
+請判斷 LINE 訊息是否為「叫車、清運、派工」相關訊息。
+
+請只回傳 JSON，不要加說明。
+
+欄位：
+{
+  "is_dispatch": true 或 false,
+  "customer": "客戶名稱",
+  "scheduled_date": "預計清運日期或時間",
+  "address": "位置或地址",
+  "waste_type": "垃圾/木材/混合物/其他",
+  "vehicle": "車輛",
+  "estimated_quantity": "預估數量",
+  "unit": "噸/kg/桶/車/米/其他",
+  "unit_price": "單價",
+  "note": "備註"
 }
 
-function nowTaiwan() {
-  return new Date().toLocaleString("zh-TW", {
-    timeZone: "Asia/Taipei",
-    hour12: false
+規則：
+- 今天時間：${today}
+- 垃圾預設單價：9元/kg
+- 木材預設單價：5元/kg
+- 3.5噸舉斗車 = ARX-9260
+- 7.5噸夾子車 = KEL-2628
+- 壓縮車以垃圾子車桶數記錄
+- 派工階段只能填預估數量，不要當作實際重量
+- 不確定的欄位填空字串
+`;
+
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: env.OPENAI_MODEL || "gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: message }
+      ]
+    })
   });
+
+  const data = await res.json();
+
+  if (!res.ok) {
+    throw new Error("OpenAI error: " + JSON.stringify(data));
+  }
+
+  return JSON.parse(data.choices[0].message.content);
 }
 
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" }
+async function appendRows(env, sheetName, rows) {
+  const token = await getGoogleAccessToken(env);
+  const range = encodeURIComponent(`${sheetName}!A:Z`);
+
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${env.SHEET_ID}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ values: rows })
+    }
+  );
+
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+}
+
+async function getGoogleAccessToken(env) {
+  const sa = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT);
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const claim = {
+    iss: sa.client_email,
+    scope: "https://www.googleapis.com/auth/spreadsheets",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now
+  };
+
+  const unsigned = `${base64UrlJson(header)}.${base64UrlJson(claim)}`;
+  const sig = await signRs256(unsigned, sa.private_key);
+  const jwt = `${unsigned}.${sig}`;
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion: jwt
+    })
   });
+
+  const data = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data.access_token;
 }
 
-async function verifyLineSignature(bodyText, channelSecret, signature) {
-  if (!signature) return false;
+async function verifyLineSignature(bodyText, secret, signature) {
+  if (!secret || !signature) return false;
 
   const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(channelSecret),
+    new TextEncoder().encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]
@@ -138,19 +222,56 @@ async function verifyLineSignature(bodyText, channelSecret, signature) {
     new TextEncoder().encode(bodyText)
   );
 
-  const expected = arrayBufferToBase64(sig);
-  return timingSafeEqual(expected, signature);
+  return arrayBufferToBase64(sig) === signature;
 }
 
-function timingSafeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  if (a.length !== b.length) return false;
+async function replyLine(env, replyToken, text) {
+  if (!env.LINE_CHANNEL_ACCESS_TOKEN) return;
 
-  let out = 0;
-  for (let i = 0; i < a.length; i++) {
-    out |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-  return out === 0;
+  await fetch("https://api.line.me/v2/bot/message/reply", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      replyToken,
+      messages: [{ type: "text", text }]
+    })
+  });
+}
+
+function nowTaiwan() {
+  return new Date().toLocaleString("zh-TW", {
+    timeZone: "Asia/Taipei",
+    hour12: false
+  });
+}
+
+function makeDispatchId() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  const r = Math.floor(Math.random() * 900 + 100);
+  return `FJ-${y}${m}${day}-${r}`;
+}
+
+function jsonResponse(data) {
+  return new Response(JSON.stringify(data, null, 2), {
+    headers: { "Content-Type": "application/json; charset=utf-8" }
+  });
+}
+
+function base64UrlJson(obj) {
+  return base64UrlEncode(new TextEncoder().encode(JSON.stringify(obj)));
+}
+
+function base64UrlEncode(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 function arrayBufferToBase64(buffer) {
@@ -160,166 +281,28 @@ function arrayBufferToBase64(buffer) {
   return btoa(binary);
 }
 
-async function appendRows(env, rows) {
-  if (!env.SHEET_ID) {
-    throw new Error("Missing SHEET_ID variable in Cloudflare Worker settings.");
-  }
-  if (!env.GOOGLE_SERVICE_ACCOUNT) {
-    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT secret.");
-  }
-
-  const sheetName = env.SHEET_NAME || DEFAULT_SHEET_NAME;
-  const accessToken = await getGoogleAccessToken(env);
-  const range = encodeURIComponent(`${sheetName}!A:H`);
-
-  const res = await fetch(
-    `https://sheets.googleapis.com/v4/spreadsheets/${env.SHEET_ID}/values/${range}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-    {
-      method: "POST",
-      headers: {
-        "authorization": `Bearer ${accessToken}`,
-        "content-type": "application/json"
-      },
-      body: JSON.stringify({ values: rows })
-    }
-  );
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Google Sheets append failed: ${res.status} ${text}`);
-  }
-
-  return res.json();
-}
-
-async function appendErrorLog(env, code, detail) {
-  try {
-    if (!env.SHEET_ID || !env.GOOGLE_SERVICE_ACCOUNT) return;
-    await appendRows(env, [[
-      nowTaiwan(),
-      "error",
-      "",
-      "",
-      "",
-      code,
-      String(detail || "").slice(0, 45000),
-      ""
-    ]]);
-  } catch (_) {
-    // Avoid recursive failures.
-  }
-}
-
-async function getGoogleAccessToken(env) {
-  const serviceAccount = parseServiceAccount(env.GOOGLE_SERVICE_ACCOUNT);
-  const now = Math.floor(Date.now() / 1000);
-
-  const header = {
-    alg: "RS256",
-    typ: "JWT"
-  };
-
-  const claim = {
-    iss: serviceAccount.client_email,
-    scope: "https://www.googleapis.com/auth/spreadsheets",
-    aud: "https://oauth2.googleapis.com/token",
-    exp: now + 3600,
-    iat: now
-  };
-
-  const unsignedJwt = `${base64UrlJson(header)}.${base64UrlJson(claim)}`;
-  const signature = await signRs256(unsignedJwt, serviceAccount.private_key);
-  const jwt = `${unsignedJwt}.${signature}`;
-
-  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-      assertion: jwt
-    })
-  });
-
-  const tokenData = await tokenRes.json();
-
-  if (!tokenRes.ok) {
-    throw new Error(`Google token error: ${tokenRes.status} ${JSON.stringify(tokenData)}`);
-  }
-
-  return tokenData.access_token;
-}
-
-function parseServiceAccount(raw) {
-  if (!raw) throw new Error("GOOGLE_SERVICE_ACCOUNT is empty.");
-  const data = typeof raw === "string" ? JSON.parse(raw) : raw;
-  if (!data.client_email || !data.private_key) {
-    throw new Error("GOOGLE_SERVICE_ACCOUNT JSON must include client_email and private_key.");
-  }
-  return data;
-}
-
-function base64UrlJson(obj) {
-  return base64UrlEncode(new TextEncoder().encode(JSON.stringify(obj)));
-}
-
-function base64UrlEncode(input) {
-  let bytes;
-  if (input instanceof Uint8Array) {
-    bytes = input;
-  } else if (input instanceof ArrayBuffer) {
-    bytes = new Uint8Array(input);
-  } else {
-    bytes = new TextEncoder().encode(String(input));
-  }
-
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
 async function signRs256(data, privateKeyPem) {
-  const key = await importPrivateKey(privateKeyPem);
-  const signature = await crypto.subtle.sign(
-    { name: "RSASSA-PKCS1-v1_5" },
-    key,
-    new TextEncoder().encode(data)
-  );
-  return base64UrlEncode(signature);
-}
-
-async function importPrivateKey(pem) {
-  const cleanPem = pem
+  const clean = privateKeyPem
     .replace(/\\n/g, "\n")
     .replace("-----BEGIN PRIVATE KEY-----", "")
     .replace("-----END PRIVATE KEY-----", "")
     .replace(/\s/g, "");
 
-  const binaryDer = Uint8Array.from(atob(cleanPem), c => c.charCodeAt(0));
+  const binary = Uint8Array.from(atob(clean), c => c.charCodeAt(0));
 
-  return crypto.subtle.importKey(
+  const key = await crypto.subtle.importKey(
     "pkcs8",
-    binaryDer.buffer,
-    {
-      name: "RSASSA-PKCS1-v1_5",
-      hash: "SHA-256"
-    },
+    binary.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"]
   );
-}
 
-async function replyLine(env, replyToken, text) {
-  if (!env.LINE_CHANNEL_ACCESS_TOKEN || !replyToken) return;
+  const sig = await crypto.subtle.sign(
+    { name: "RSASSA-PKCS1-v1_5" },
+    key,
+    new TextEncoder().encode(data)
+  );
 
-  await fetch("https://api.line.me/v2/bot/message/reply", {
-    method: "POST",
-    headers: {
-      "authorization": `Bearer ${env.LINE_CHANNEL_ACCESS_TOKEN}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      replyToken,
-      messages: [{ type: "text", text }]
-    })
-  });
+  return base64UrlEncode(sig);
 }
