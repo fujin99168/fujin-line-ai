@@ -1,10 +1,18 @@
+// Fujin LINE AI v2.1
+// LINE → Cloudflare Worker → OpenAI → Google Sheets
+
 const SHEET_AI = "AI派工";
 const SHEET_DISPATCH = "01_派工紀錄";
 
 export default {
   async fetch(request, env, ctx) {
     if (request.method === "GET") {
-      return jsonResponse({ ok: true, service: "Fujin LINE AI", version: "v2" });
+      return jsonResponse({
+        ok: true,
+        service: "Fujin LINE AI",
+        version: "v2.1",
+        message: "Webhook is running"
+      });
     }
 
     if (request.method !== "POST") {
@@ -15,25 +23,33 @@ export default {
 
     try {
       const signature = request.headers.get("x-line-signature") || "";
-      const valid = await verifyLineSignature(bodyText, env.LINE_CHANNEL_SECRET, signature);
-      if (!valid) return new Response("Unauthorized", { status: 401 });
+
+      if (env.LINE_CHANNEL_SECRET) {
+        const valid = await verifyLineSignature(
+          bodyText,
+          env.LINE_CHANNEL_SECRET,
+          signature
+        );
+
+        if (!valid) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+      }
 
       const payload = JSON.parse(bodyText || "{}");
-      const events = payload.events || [];
+      const events = Array.isArray(payload.events) ? payload.events : [];
 
       for (const event of events) {
         if (event.type !== "message") continue;
         if (!event.message || event.message.type !== "text") continue;
 
         const text = event.message.text || "";
-        const source = event.source || {};
+        const source = event.source || "";
 
         const ai = await parseDispatchWithAI(text, env);
 
         if (!ai.is_dispatch) {
-          if (event.replyToken) {
-            await replyLine(env, event.replyToken, "已收到，但我判斷這不是派工訊息。");
-          }
+          await replyLine(env, event.replyToken, "已收到，但判斷不是派工訊息。");
           continue;
         }
 
@@ -70,62 +86,85 @@ export default {
           source.groupId || ""
         ]]);
 
-        if (event.replyToken) {
-          await replyLine(env, event.replyToken,
-`已建立派工：
+        await replyLine(env, event.replyToken,
+`✅ 已建立派工
+
 編號：${dispatchId}
 客戶：${ai.customer || "未判斷"}
 日期：${ai.scheduled_date || "未填"}
 種類：${ai.waste_type || "未填"}
 位置：${ai.address || "未填"}
 車輛：${ai.vehicle || "未填"}
-預估：${ai.estimated_quantity || "未填"}`
-          );
-        }
+預估：${ai.estimated_quantity || "未填"}
+單價：${ai.unit_price || "未填"}`
+        );
       }
 
       return new Response("OK", { status: 200 });
+
     } catch (err) {
-      console.log("ERROR", err.stack || err);
+      const msg = String(err && err.stack ? err.stack : err).slice(0, 1000);
+      console.log("ERROR", msg);
+
+      try {
+        const payload = JSON.parse(bodyText || "{}");
+        const event = payload.events && payload.events[0];
+        if (event && event.replyToken) {
+          await replyLine(env, event.replyToken, "系統錯誤：\n" + msg);
+        }
+      } catch (_) {}
+
       return new Response("OK", { status: 200 });
     }
   }
 };
 
 async function parseDispatchWithAI(message, env) {
-  if (!env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+  if (!env.OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY");
+  }
 
   const today = nowTaiwan();
 
   const systemPrompt = `
 你是福進環保有限公司的派工AI。
-請判斷 LINE 訊息是否為「叫車、清運、派工」相關訊息。
 
-請只回傳 JSON，不要加說明。
+你的任務：
+判斷 LINE 訊息是否為叫車、清運、派工相關訊息。
+如果是，解析成 JSON。
+如果不是派工，is_dispatch=false。
 
-欄位：
+只回傳 JSON，不要加說明。
+
+JSON 格式：
 {
-  "is_dispatch": true 或 false,
-  "customer": "客戶名稱",
-  "scheduled_date": "預計清運日期或時間",
-  "address": "位置或地址",
-  "waste_type": "垃圾/木材/混合物/其他",
-  "vehicle": "車輛",
-  "estimated_quantity": "預估數量",
-  "unit": "噸/kg/桶/車/米/其他",
-  "unit_price": "單價",
-  "note": "備註"
+  "is_dispatch": true,
+  "customer": "",
+  "scheduled_date": "",
+  "address": "",
+  "waste_type": "",
+  "vehicle": "",
+  "estimated_quantity": "",
+  "unit": "",
+  "unit_price": "",
+  "note": ""
 }
 
-規則：
+福進環保規則：
 - 今天時間：${today}
+- 派工階段只能記錄預估數量，不是實際重量。
 - 垃圾預設單價：9元/kg
 - 木材預設單價：5元/kg
 - 3.5噸舉斗車 = ARX-9260
 - 7.5噸夾子車 = KEL-2628
+- 17噸夾子車若未給車號，可填「17噸夾子車」
 - 壓縮車以垃圾子車桶數記錄
-- 派工階段只能填預估數量，不要當作實際重量
 - 不確定的欄位填空字串
+- 如果出現「垃圾」，waste_type 填「垃圾」
+- 如果出現「木材、板模、廢木」，waste_type 填「木材」
+- 如果出現「混合物」，waste_type 填「混合物」
+- 如果出現「9260、3.5噸」，vehicle 填「ARX-9260」
+- 如果出現「2628、7.5噸、夾子車」，vehicle 填「KEL-2628」
 `;
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -150,11 +189,19 @@ async function parseDispatchWithAI(message, env) {
     throw new Error("OpenAI error: " + JSON.stringify(data));
   }
 
-  return JSON.parse(data.choices[0].message.content);
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error("OpenAI response empty");
+  }
+
+  return JSON.parse(content);
 }
 
 async function appendRows(env, sheetName, rows) {
-  const token = await getGoogleAccessToken(env);
+  if (!env.SHEET_ID) throw new Error("Missing SHEET_ID");
+  if (!env.GOOGLE_SERVICE_ACCOUNT) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT");
+
+  const accessToken = await getGoogleAccessToken(env);
   const range = encodeURIComponent(`${sheetName}!A:Z`);
 
   const res = await fetch(
@@ -162,7 +209,7 @@ async function appendRows(env, sheetName, rows) {
     {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${token}`,
+        "Authorization": `Bearer ${accessToken}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ values: rows })
@@ -170,30 +217,37 @@ async function appendRows(env, sheetName, rows) {
   );
 
   if (!res.ok) {
-    throw new Error(await res.text());
+    const text = await res.text();
+    throw new Error(`Google Sheets append failed: ${res.status} ${text}`);
   }
 }
 
 async function getGoogleAccessToken(env) {
-  const sa = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT);
+  const serviceAccount = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT);
   const now = Math.floor(Date.now() / 1000);
 
-  const header = { alg: "RS256", typ: "JWT" };
+  const header = {
+    alg: "RS256",
+    typ: "JWT"
+  };
+
   const claim = {
-    iss: sa.client_email,
+    iss: serviceAccount.client_email,
     scope: "https://www.googleapis.com/auth/spreadsheets",
     aud: "https://oauth2.googleapis.com/token",
     exp: now + 3600,
     iat: now
   };
 
-  const unsigned = `${base64UrlJson(header)}.${base64UrlJson(claim)}`;
-  const sig = await signRs256(unsigned, sa.private_key);
-  const jwt = `${unsigned}.${sig}`;
+  const unsignedJwt = `${base64UrlJson(header)}.${base64UrlJson(claim)}`;
+  const signature = await signRs256(unsignedJwt, serviceAccount.private_key);
+  const jwt = `${unsignedJwt}.${signature}`;
 
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: jwt
@@ -201,16 +255,20 @@ async function getGoogleAccessToken(env) {
   });
 
   const data = await res.json();
-  if (!res.ok) throw new Error(JSON.stringify(data));
+
+  if (!res.ok) {
+    throw new Error("Google token error: " + JSON.stringify(data));
+  }
+
   return data.access_token;
 }
 
-async function verifyLineSignature(bodyText, secret, signature) {
-  if (!secret || !signature) return false;
+async function verifyLineSignature(bodyText, channelSecret, signature) {
+  if (!signature) return false;
 
   const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(secret),
+    new TextEncoder().encode(channelSecret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"]
@@ -226,7 +284,7 @@ async function verifyLineSignature(bodyText, secret, signature) {
 }
 
 async function replyLine(env, replyToken, text) {
-  if (!env.LINE_CHANNEL_ACCESS_TOKEN) return;
+  if (!env.LINE_CHANNEL_ACCESS_TOKEN || !replyToken) return;
 
   await fetch("https://api.line.me/v2/bot/message/reply", {
     method: "POST",
@@ -236,7 +294,12 @@ async function replyLine(env, replyToken, text) {
     },
     body: JSON.stringify({
       replyToken,
-      messages: [{ type: "text", text }]
+      messages: [
+        {
+          type: "text",
+          text
+        }
+      ]
     })
   });
 }
@@ -257,9 +320,12 @@ function makeDispatchId() {
   return `FJ-${y}${m}${day}-${r}`;
 }
 
-function jsonResponse(data) {
+function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
-    headers: { "Content-Type": "application/json; charset=utf-8" }
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8"
+    }
   });
 }
 
@@ -268,10 +334,23 @@ function base64UrlJson(obj) {
 }
 
 function base64UrlEncode(input) {
-  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  let bytes;
+
+  if (input instanceof Uint8Array) {
+    bytes = input;
+  } else if (input instanceof ArrayBuffer) {
+    bytes = new Uint8Array(input);
+  } else {
+    bytes = new TextEncoder().encode(String(input));
+  }
+
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 function arrayBufferToBase64(buffer) {
@@ -282,27 +361,30 @@ function arrayBufferToBase64(buffer) {
 }
 
 async function signRs256(data, privateKeyPem) {
-  const clean = privateKeyPem
+  const cleanPem = privateKeyPem
     .replace(/\\n/g, "\n")
     .replace("-----BEGIN PRIVATE KEY-----", "")
     .replace("-----END PRIVATE KEY-----", "")
     .replace(/\s/g, "");
 
-  const binary = Uint8Array.from(atob(clean), c => c.charCodeAt(0));
+  const binaryDer = Uint8Array.from(atob(cleanPem), c => c.charCodeAt(0));
 
   const key = await crypto.subtle.importKey(
     "pkcs8",
-    binary.buffer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    binaryDer.buffer,
+    {
+      name: "RSASSA-PKCS1-v1_5",
+      hash: "SHA-256"
+    },
     false,
     ["sign"]
   );
 
-  const sig = await crypto.subtle.sign(
+  const signature = await crypto.subtle.sign(
     { name: "RSASSA-PKCS1-v1_5" },
     key,
     new TextEncoder().encode(data)
   );
 
-  return base64UrlEncode(sig);
+  return base64UrlEncode(signature);
 }
