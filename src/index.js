@@ -1,4 +1,4 @@
-// Fujin LINE AI v2.1
+// Fujin LINE AI v3.0
 // LINE → Cloudflare Worker → OpenAI → Google Sheets
 
 const SHEET_AI = "AI派工";
@@ -10,7 +10,7 @@ export default {
       return jsonResponse({
         ok: true,
         service: "Fujin LINE AI",
-        version: "v2.1",
+        version: "v3.0",
         message: "Webhook is running"
       });
     }
@@ -25,12 +25,7 @@ export default {
       const signature = request.headers.get("x-line-signature") || "";
 
       if (env.LINE_CHANNEL_SECRET) {
-        const valid = await verifyLineSignature(
-          bodyText,
-          env.LINE_CHANNEL_SECRET,
-          signature
-        );
-
+        const valid = await verifyLineSignature(bodyText, env.LINE_CHANNEL_SECRET, signature);
         if (!valid) {
           return new Response("Unauthorized", { status: 401 });
         }
@@ -44,7 +39,7 @@ export default {
         if (!event.message || event.message.type !== "text") continue;
 
         const text = event.message.text || "";
-        const source = event.source || "";
+        const source = event.source || {};
 
         const ai = await parseDispatchWithAI(text, env);
 
@@ -103,12 +98,13 @@ export default {
       return new Response("OK", { status: 200 });
 
     } catch (err) {
-      const msg = String(err && err.stack ? err.stack : err).slice(0, 1000);
+      const msg = String(err && err.stack ? err.stack : err).slice(0, 1200);
       console.log("ERROR", msg);
 
       try {
         const payload = JSON.parse(bodyText || "{}");
         const event = payload.events && payload.events[0];
+
         if (event && event.replyToken) {
           await replyLine(env, event.replyToken, "系統錯誤：\n" + msg);
         }
@@ -120,21 +116,16 @@ export default {
 };
 
 async function parseDispatchWithAI(message, env) {
-  if (!env.OPENAI_API_KEY) {
-    throw new Error("Missing OPENAI_API_KEY");
-  }
+  if (!env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
 
   const today = nowTaiwan();
 
   const systemPrompt = `
 你是福進環保有限公司的派工AI。
 
-你的任務：
-判斷 LINE 訊息是否為叫車、清運、派工相關訊息。
-如果是，解析成 JSON。
-如果不是派工，is_dispatch=false。
+請判斷 LINE 訊息是否為叫車、清運、派工相關訊息。
 
-只回傳 JSON，不要加說明。
+只回傳 JSON，不要加任何說明。
 
 JSON 格式：
 {
@@ -150,21 +141,19 @@ JSON 格式：
   "note": ""
 }
 
-福進環保規則：
+規則：
 - 今天時間：${today}
-- 派工階段只能記錄預估數量，不是實際重量。
-- 垃圾預設單價：9元/kg
-- 木材預設單價：5元/kg
-- 3.5噸舉斗車 = ARX-9260
-- 7.5噸夾子車 = KEL-2628
-- 17噸夾子車若未給車號，可填「17噸夾子車」
+- 派工階段只記錄預估，不是實際重量。
+- 垃圾預設單價：9
+- 木材預設單價：5
+- 3.5噸、9260、舉斗車 → vehicle 填 ARX-9260
+- 7.5噸、2628、夾子車 → vehicle 填 KEL-2628
+- 17噸夾子車若未給車號，vehicle 填 17噸夾子車
 - 壓縮車以垃圾子車桶數記錄
-- 不確定的欄位填空字串
-- 如果出現「垃圾」，waste_type 填「垃圾」
-- 如果出現「木材、板模、廢木」，waste_type 填「木材」
-- 如果出現「混合物」，waste_type 填「混合物」
-- 如果出現「9260、3.5噸」，vehicle 填「ARX-9260」
-- 如果出現「2628、7.5噸、夾子車」，vehicle 填「KEL-2628」
+- 垃圾、一般垃圾 → waste_type 填 垃圾
+- 木材、板模、廢木 → waste_type 填 木材
+- 混合物 → waste_type 填 混合物
+- 不確定欄位填空字串
 `;
 
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -190,9 +179,7 @@ JSON 格式：
   }
 
   const content = data.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error("OpenAI response empty");
-  }
+  if (!content) throw new Error("OpenAI response empty");
 
   return JSON.parse(content);
 }
@@ -201,7 +188,7 @@ async function appendRows(env, sheetName, rows) {
   if (!env.SHEET_ID) throw new Error("Missing SHEET_ID");
   if (!env.GOOGLE_SERVICE_ACCOUNT) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT");
 
-  const accessToken = await getGoogleAccessToken(env);
+  const token = await getGoogleAccessToken(env);
   const range = encodeURIComponent(`${sheetName}!A:Z`);
 
   const res = await fetch(
@@ -209,7 +196,7 @@ async function appendRows(env, sheetName, rows) {
     {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${accessToken}`,
+        "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ values: rows })
@@ -218,7 +205,7 @@ async function appendRows(env, sheetName, rows) {
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Google Sheets append failed: ${res.status} ${text}`);
+    throw new Error(`Google Sheets append failed on ${sheetName}: ${res.status} ${text}`);
   }
 }
 
@@ -226,10 +213,7 @@ async function getGoogleAccessToken(env) {
   const serviceAccount = JSON.parse(env.GOOGLE_SERVICE_ACCOUNT);
   const now = Math.floor(Date.now() / 1000);
 
-  const header = {
-    alg: "RS256",
-    typ: "JWT"
-  };
+  const header = { alg: "RS256", typ: "JWT" };
 
   const claim = {
     iss: serviceAccount.client_email,
@@ -245,9 +229,7 @@ async function getGoogleAccessToken(env) {
 
   const res = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
       assertion: jwt
@@ -294,12 +276,7 @@ async function replyLine(env, replyToken, text) {
     },
     body: JSON.stringify({
       replyToken,
-      messages: [
-        {
-          type: "text",
-          text
-        }
-      ]
+      messages: [{ type: "text", text }]
     })
   });
 }
@@ -323,9 +300,7 @@ function makeDispatchId() {
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8"
-    }
+    headers: { "Content-Type": "application/json; charset=utf-8" }
   });
 }
 
@@ -372,10 +347,7 @@ async function signRs256(data, privateKeyPem) {
   const key = await crypto.subtle.importKey(
     "pkcs8",
     binaryDer.buffer,
-    {
-      name: "RSASSA-PKCS1-v1_5",
-      hash: "SHA-256"
-    },
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"]
   );
