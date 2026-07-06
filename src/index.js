@@ -104,12 +104,6 @@ export default {
   console.log(err);
   return new Response(String(err), { status: 500 });
 }
-        }
-      } catch (_) {}
-
-      return new Response("OK", { status: 200 });
-    }
-  }
 };
 
 async function parseDispatchWithAI(message, env) {
