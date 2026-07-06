@@ -88,13 +88,13 @@ export default {
 `✅ 已建立派工
 
 編號：${dispatchId}
-客戶：${ai.customer || `未判斷`}
-日期：${ai.scheduled_date || `未填`}
-種類：${ai.waste_type || `未填`}
-位置：${ai.address || `未填`}
-車輛：${ai.vehicle || `未填`}
-預估：${ai.estimated_quantity || `未填`}
-單價：${ai.unit_price || `未填`}`
+客戶：${ai.customer || “未判斷“}
+日期：${ai.scheduled_date || “未填“}
+種類：${ai.waste_type || “未填“}
+位置：${ai.address || “未填“}
+車輛：${ai.vehicle || “未填“}
+預估：${ai.estimated_quantity || “未填“}
+單價：${ai.unit_price || “未填“}`
         );
       }
 
