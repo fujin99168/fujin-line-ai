@@ -203,10 +203,16 @@ async function appendRows(env, sheetName, rows) {
     }
   );
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Google Sheets append failed on ${sheetName}: ${res.status} ${text}`);
-  }
+if (!res.ok) {
+  const text = await res.text();
+
+  console.log("========== GOOGLE ERROR ==========");
+  console.log("Sheet:", sheetName);
+  console.log("Status:", res.status);
+  console.log(text);
+
+  throw new Error(text);
+}
 }
 
 async function getGoogleAccessToken(env) {
