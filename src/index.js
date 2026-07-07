@@ -41,25 +41,7 @@ export default {
         if (!event.message || event.message.type !== "text") continue;
 
         const text = event.message.text || "";
-const source = event.source || {};
 
-await replyLine(env, event.replyToken, "① 收到");
-
-const ai = await parseDispatchWithAI(text, env);
-
-await replyLine(env, event.replyToken, "② AI完成");
-
-const now = nowTaiwan();
-const dispatchId = makeDispatchId();
-
-await appendRows(env, SHEET_AI, [[
-  now,
-  ai.customer || ""
-]]);
-
-await replyLine(env, event.replyToken, "③ AI派工寫入");
-
-return new Response("OK", { status: 200 });
         const source = event.source || {};
 
         const ai = await parseDispatchWithAI(text, env);
