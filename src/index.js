@@ -41,7 +41,6 @@ export default {
         if (!event.message || event.message.type !== "text") continue;
 
         const text = event.message.text || "";
-        const text = event.message.text || "";
 const source = event.source || {};
 
 await replyLine(env, event.replyToken, "① 收到");
