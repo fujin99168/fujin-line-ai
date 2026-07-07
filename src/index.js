@@ -41,6 +41,8 @@ export default {
         if (!event.message || event.message.type !== "text") continue;
 
         const text = event.message.text || "";
+        await replyLine(env, event.replyToken, "✅ v3 收到訊息：" + text);
+return new Response("OK", { status: 200 });
         const source = event.source || {};
 
         const ai = await parseDispatchWithAI(text, env);
